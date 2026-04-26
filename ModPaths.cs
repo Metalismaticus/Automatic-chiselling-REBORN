@@ -28,6 +28,9 @@ namespace AutomaticChiselling
         public static string Scripts => Path.Combine(Root, "scripts");
         public static string Progress => Path.Combine(Root, "progress");
 
+        /// <summary>Folder where players drop .obj (+ .mtl + textures) files to import.</summary>
+        public static string ObjImports => Path.Combine(Root, "obj_imports");
+
         /// <summary>File where per-model palette→block mappings are persisted across sessions.</summary>
         public static string MappingsFile => Path.Combine(Root, "material_mappings.json");
 
@@ -41,6 +44,7 @@ namespace AutomaticChiselling
             Directory.CreateDirectory(Models);
             Directory.CreateDirectory(Scripts);
             Directory.CreateDirectory(Progress);
+            Directory.CreateDirectory(ObjImports);
 
             // Write README for scripts — always overwrite so mod updates refresh the doc.
             // (This file is reference, not user-editable.)

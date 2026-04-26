@@ -95,6 +95,23 @@ namespace AutomaticChiselling
         private int opsPerTick = 1;
         private int maxOpsPerTick = 8;
         private int successStreak = 0;
+        private bool adaptiveSpeed = true;
+
+        /// <summary>
+        /// Reads ModSettings and applies them to the conveyor's speed state.
+        /// Picks the SP or MP track based on the client's current connection.
+        /// Called at StartConveyor and ResumeFromIndex so live changes take effect
+        /// at the next run.
+        /// </summary>
+        private void ApplySpeedSettings()
+        {
+            var s = ModSettings.Instance;
+            adaptiveSpeed = s.AdaptiveSpeed;
+            bool sp = capi.IsSinglePlayer;
+            maxOpsPerTick = sp ? s.MaxOpsPerTickSP : s.MaxOpsPerTickMP;
+            int initial  = sp ? s.InitialOpsPerTickSP : s.InitialOpsPerTickMP;
+            opsPerTick = Math.Min(initial, maxOpsPerTick);
+        }
 
         // Caches
         private HashSet<BlockPos> confirmedChiselBlocks = new HashSet<BlockPos>();
@@ -126,6 +143,37 @@ namespace AutomaticChiselling
         {
             capi = clientApi;
             myVox = storage;
+        }
+
+        /// <summary>
+        /// Returns the expected ops/sec given the current connection (SP/MP) and
+        /// the user's speed settings. Used for PRE-RUN estimates in the Model
+        /// Browser. Actual runtime ETA uses measured throughput, not this value.
+        ///
+        /// Adaptive ON: averages Initial and Max since the rate ramps linearly
+        /// during the run. Adaptive OFF: fixed at Initial.
+        /// </summary>
+        public static float EstimateOpsPerSec(ICoreClientAPI capi)
+        {
+            var s = ModSettings.Instance;
+            bool sp = capi.IsSinglePlayer;
+            int ticksPerSec = sp ? 40 : 10;          // matches RegisterGameTickListener(25ms / 100ms)
+            int initial = sp ? s.InitialOpsPerTickSP : s.InitialOpsPerTickMP;
+            int max     = sp ? s.MaxOpsPerTickSP     : s.MaxOpsPerTickMP;
+            float effective = s.AdaptiveSpeed ? (initial + max) * 0.5f : initial;
+            if (effective < 1f) effective = 1f;
+            return effective * ticksPerSec;
+        }
+
+        /// <summary>
+        /// Pre-run time estimate in seconds for the given op count, using the
+        /// current settings and connection mode.
+        /// </summary>
+        public static int EstimateSeconds(ICoreClientAPI capi, int ops)
+        {
+            if (ops <= 0) return 0;
+            float opsPerSec = EstimateOpsPerSec(capi);
+            return (int)Math.Ceiling(ops / opsPerSec);
         }
 
         /// <summary>
@@ -189,9 +237,8 @@ namespace AutomaticChiselling
             lastChiseledBlock = null;
             lastSentMs = 0;
 
-            // Adaptive speed init
-            opsPerTick = capi.IsSinglePlayer ? 3 : 1;
-            maxOpsPerTick = capi.IsSinglePlayer ? 8 : 6;
+            // Speed init — prefer user settings, fall back to SP/MP defaults.
+            ApplySpeedSettings();
             successStreak = 0;
             confirmedChiselBlocks.Clear();
             materialsInitialized.Clear();
@@ -258,9 +305,8 @@ namespace AutomaticChiselling
                 capi.ShowChatMessage($"Skipped {filtered} already-completed operations.");
             }
 
-            // Adaptive speed init
-            opsPerTick = capi.IsSinglePlayer ? 3 : 1;
-            maxOpsPerTick = capi.IsSinglePlayer ? 8 : 6;
+            // Speed init — prefer user settings, fall back to SP/MP defaults.
+            ApplySpeedSettings();
             successStreak = 0;
             confirmedChiselBlocks.Clear();
             materialsInitialized.Clear();
@@ -726,9 +772,10 @@ namespace AutomaticChiselling
 
             // Server lag protection (ChiselWiz style)
             long now = capi.ElapsedMilliseconds;
-            if (!capi.IsSinglePlayer && lastSentMs > 0 && (now - lastSentMs) > SERVER_LAG_THRESHOLD_MS)
+            if (adaptiveSpeed && !capi.IsSinglePlayer && lastSentMs > 0
+                && (now - lastSentMs) > SERVER_LAG_THRESHOLD_MS)
             {
-                // Lag detected — reduce speed
+                // Lag detected — reduce speed (only when adaptive is enabled)
                 opsPerTick = Math.Max(1, opsPerTick / 2);
                 successStreak = 0;
                 return;
@@ -838,9 +885,10 @@ namespace AutomaticChiselling
             lastSentMs = now;
             ReportProgress();
 
-            // Adaptive speed: increase after sustained success
+            // Adaptive speed: increase after sustained success (skipped when user
+            // disabled adaptive mode — speed stays locked at InitialOpsPerTick).
             successStreak++;
-            if (successStreak % 20 == 0 && opsPerTick < maxOpsPerTick)
+            if (adaptiveSpeed && successStreak % 20 == 0 && opsPerTick < maxOpsPerTick)
             {
                 opsPerTick++;
             }
@@ -1542,6 +1590,40 @@ namespace AutomaticChiselling
             {
                 var path = GetProgressFilePath();
                 if (File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// Deletes the progress file for a specific model by name. Public so
+        /// HUD Stop callback can clear it even when no live ChiselConveyor
+        /// instance exists (e.g. after auto-restore, before user presses Start).
+        /// </summary>
+        public static void DeleteProgressFile(string modelFileName)
+        {
+            if (string.IsNullOrEmpty(modelFileName)) return;
+            try
+            {
+                string path = Path.Combine(ModPaths.Progress, modelFileName + "_progress.json");
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// Deletes ALL progress files in the progress folder. Used by Stop
+        /// when we don't know (or can't determine) which model's progress
+        /// is stale, to prevent zombie "Resume?" prompts.
+        /// </summary>
+        public static void DeleteAllProgressFiles()
+        {
+            try
+            {
+                if (!Directory.Exists(ModPaths.Progress)) return;
+                foreach (var f in Directory.GetFiles(ModPaths.Progress, "*_progress.json"))
+                {
+                    try { File.Delete(f); } catch { }
+                }
             }
             catch (Exception) { }
         }

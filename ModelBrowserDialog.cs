@@ -105,8 +105,43 @@ namespace AutomaticChiselling
             }
         }
 
-        // Current tab: 0 = Models, 1 = Generators
+        // Current tab: 0 = Models, 1 = Generators, 2 = Import, 3 = Settings
         private int currentTab = 0;
+
+        // Import tab state
+        private List<string> importObjFiles = new List<string>();
+        private int importSelectedIdx = -1;
+        private readonly VoxelizeSettings importSettings = new VoxelizeSettings
+        {
+            Resolution = 64, FillInterior = true, FlipY = false, SwapYZ = false
+        };
+        private GeneratedShape importPreviewShape;
+        private LoadedTexture importPreviewTexture;
+        private string importStatus = "";
+        private bool importSaveAsVox = true;
+        private ElementBounds importPreviewBoxBounds;
+        private ElementBounds importInsetBounds;
+        private string importLastBuiltFor = ""; // "path|res|fill|flipY|swapYZ" — skip voxelization if unchanged
+
+        // 3D preview camera (yaw/pitch in radians). Default to a three-quarter iso view.
+        private double importPreviewYaw = 30 * Math.PI / 180.0;
+        private double importPreviewPitch = 20 * Math.PI / 180.0;
+        private string importTextureKey = ""; // cache: textures depend on voxelized shape AND camera angles
+
+        // Mouse-drag rotation state (Import tab only)
+        private bool importDragging = false;
+        private double importDragStartX, importDragStartY;
+        private double importDragStartYaw, importDragStartPitch;
+        private long importLastDragRebuildMs = 0;
+
+        // 3D preview camera for Generators tab (same iso defaults as Import).
+        private double genPreviewYaw = 30 * Math.PI / 180.0;
+        private double genPreviewPitch = 20 * Math.PI / 180.0;
+        private VoxelsStorage cachedGeneratorStorage; // last generated storage, used for camera-only re-renders
+        private bool genDragging = false;
+        private double genDragStartX, genDragStartY;
+        private double genDragStartYaw, genDragStartPitch;
+        private long genLastDragRebuildMs = 0;
 
         // Generator state
         private List<IShapeGenerator> generators = new List<IShapeGenerator>();
@@ -225,7 +260,7 @@ namespace AutomaticChiselling
                     m.ChiselsNeeded = (float)Math.Ceiling(ops / (double)CHISEL_DURABILITY * 10) / 10f;
                     m.SizeX = dims.X; m.SizeY = dims.Y; m.SizeZ = dims.Z;
                     m.InteriorFilled = storage.InteriorVoxelsFilled;
-                    m.TimeEstimateSP = FormatTime((int)(ops / OPS_PER_SEC_SP));
+                    m.TimeEstimateSP = FormatTime(ChiselConveyor.EstimateSeconds(capi, ops));
                     m.PreviewTexture = ModelPreview.CreatePreviewTexture(capi, storage);
                     m.IsColored = storage.IsColored;
                     m.UsedPaletteIndices = new List<byte>(storage.UsedPaletteIndices);
@@ -287,12 +322,18 @@ namespace AutomaticChiselling
                 .BeginChildElements();
 
             // Tab buttons
-            var tab1Bounds = ElementBounds.Fixed(5, GuiStyle.TitleBarHeight + 2, 120, TAB_H - 4);
+            var tab1Bounds = ElementBounds.Fixed(5,   GuiStyle.TitleBarHeight + 2, 120, TAB_H - 4);
             var tab2Bounds = ElementBounds.Fixed(130, GuiStyle.TitleBarHeight + 2, 120, TAB_H - 4);
+            var tab3Bounds = ElementBounds.Fixed(255, GuiStyle.TitleBarHeight + 2, 120, TAB_H - 4);
+            var tab4Bounds = ElementBounds.Fixed(380, GuiStyle.TitleBarHeight + 2, 120, TAB_H - 4);
             comp.AddSmallButton("Models", () => { SwitchTab(0); return true; },
                 tab1Bounds, currentTab == 0 ? EnumButtonStyle.Normal : EnumButtonStyle.Small, "tabModels");
             comp.AddSmallButton("Generators", () => { SwitchTab(1); return true; },
                 tab2Bounds, currentTab == 1 ? EnumButtonStyle.Normal : EnumButtonStyle.Small, "tabGenerators");
+            comp.AddSmallButton("Import OBJ", () => { SwitchTab(2); return true; },
+                tab3Bounds, currentTab == 2 ? EnumButtonStyle.Normal : EnumButtonStyle.Small, "tabImport");
+            comp.AddSmallButton("Settings", () => { SwitchTab(3); return true; },
+                tab4Bounds, currentTab == 3 ? EnumButtonStyle.Normal : EnumButtonStyle.Small, "tabSettings");
 
             // Content
             comp.AddInset(insetBounds, 3);
@@ -376,6 +417,18 @@ namespace AutomaticChiselling
                 SingleComposer = comp.Compose();
                 SingleComposer.GetScrollbar("scrollbar")?.SetHeights((float)INSET_H, scrollTotalH);
                 OnNewScrollbarValue(0);
+            }
+            else if (currentTab == 3)
+            {
+                // --- SETTINGS TAB ---
+                BuildSettingsTab(comp, insetBounds);
+                SingleComposer = comp.Compose();
+            }
+            else if (currentTab == 2)
+            {
+                // --- IMPORT TAB (OBJ → voxel) ---
+                BuildImportTab(comp, insetBounds);
+                SingleComposer = comp.Compose();
             }
             else
             {
@@ -469,8 +522,9 @@ namespace AutomaticChiselling
             // Card right edge is DLG_W-25 (=795), so button → edge gap = 20px.
             double tx = 160, tw = DLG_W - tx - 156;
 
-            // Line 1 — filename (bold, white)
-            scrollArea.Add(new GuiElementStaticText(capi, $"{m.FileName}.vox",
+            // Line 1 — filename (bold, white). Truncated so timestamp-style
+            // file names don't run under the Load button.
+            scrollArea.Add(new GuiElementStaticText(capi, $"{TruncateName(m.FileName)}.vox",
                 EnumTextOrientation.Left, ElementBounds.Fixed(tx, rowBounds.fixedY + 10, tw, 22),
                 CairoFont.WhiteSmallishText().WithWeight(Cairo.FontWeight.Bold)));
 
@@ -694,14 +748,16 @@ namespace AutomaticChiselling
                     string current = ParamString(pId, param.Default as string ?? "");
                     string display = current;
                     if (string.IsNullOrEmpty(display)) display = "(click to edit)";
-                    if (display.Length > 32) display = display.Substring(0, 32) + "…";
+                    // Narrower than before — the 280px button used to overlap the
+                    // preview box on the right. 235px fits cleanly with ~10px gap.
+                    if (display.Length > 22) display = display.Substring(0, 21) + "…";
 
                     string capturedPId = pId;
                     string capturedLabel = param.Label;
                     area.Add(new GuiElementTextButton(capi, display,
                         CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
                         () => { OpenTextInputPopup(capturedPId, capturedLabel); return true; },
-                        ElementBounds.Fixed(L + 180, y, 280, 28), EnumButtonStyle.Small));
+                        ElementBounds.Fixed(L + 180, y, 235, 28), EnumButtonStyle.Small));
                 }
                 else // Slider
                 {
@@ -837,6 +893,549 @@ namespace AutomaticChiselling
             SetupDialog();
         }
 
+        /// <summary>
+        /// Renders the Settings tab — separate SP / MP speed caps + adaptive toggle.
+        /// Uses a child container placed inside the inset so layout is consistent
+        /// with how Generators tab builds its UI.
+        /// </summary>
+        /// <summary>
+        /// Renders the Import tab — scan obj_imports/ folder, pick a .obj, tune
+        /// voxelization params, preview the result, then generate & load like any
+        /// other model. Kd diffuse colors drive the palette; textures are ignored
+        /// in v1 for cross-platform compatibility (no System.Drawing.Common).
+        /// </summary>
+        private void BuildImportTab(GuiComposer comp, ElementBounds insetBounds)
+        {
+            importInsetBounds = insetBounds;
+            RescanObjFolder();
+
+            // --- Preview box on the RIGHT side of the inset (like Generators tab) ---
+            const int PV_SIZE = 330;
+            int rightMargin = 20;
+            int topMargin = 10;
+            int leftMargin = DLG_W - PV_SIZE - rightMargin;
+            int bottomMargin = INSET_H - topMargin - PV_SIZE;
+            importPreviewBoxBounds = insetBounds.ForkContainingChild(
+                leftMargin, topMargin, rightMargin, bottomMargin);
+
+            comp.AddStaticCustomDraw(importPreviewBoxBounds, (ctx, s, b) =>
+            {
+                ctx.SetSourceRGBA(0.08, 0.08, 0.1, 0.85);
+                RoundRect(ctx, b.drawX, b.drawY, b.InnerWidth, b.InnerHeight, 4);
+                ctx.Fill();
+                ctx.SetSourceRGBA(0.3, 0.32, 0.35, 0.4);
+                RoundRect(ctx, b.drawX, b.drawY, b.InnerWidth, b.InnerHeight, 4);
+                ctx.LineWidth = 1; ctx.Stroke();
+            });
+
+            // --- Controls container on the LEFT side ---
+            // leftPad=20; rightPad reserves the preview column + a 16px gap.
+            var area2 = insetBounds.ForkContainingChild(20, 12, PV_SIZE + rightMargin + 16, 12);
+            comp.AddContainer(area2, "import-content");
+            comp.EndChildElements();
+            var area = comp.GetContainer("import-content");
+
+            // Clamp file selection BEFORE firing the preview rebuild — otherwise
+            // on the first tab open selectedIdx == -1 and the rebuild is a no-op,
+            // so the preview box sits empty until the user toggles something.
+            if (importObjFiles.Count > 0 &&
+                (importSelectedIdx < 0 || importSelectedIdx >= importObjFiles.Count))
+            {
+                importSelectedIdx = 0;
+            }
+
+            // Eagerly rebuild the preview so it appears as soon as the tab opens or
+            // a settings toggle is flipped. Voxelization at res≈64 on modest meshes
+            // is sub-second; the key-signature check below skips redundant work.
+            RebuildImportPreviewIfNeeded();
+
+            // Layout mirrors the Generators tab (L=15 margin, labelW=170) so rows
+            // end well before the preview column and nothing wraps onto the picture.
+            const double L = 15;
+            const double ROW = 38;
+            const double labelW = 170;
+            const double ctrlX = L + labelW + 10; // same offset Generators uses
+            // Max width of multi-line text (description, status) in the left column.
+            const double CTRL_W = 400;
+            double y = 0;
+
+            // --- Header ---
+            area.Add(new GuiElementStaticText(capi, "Import .obj → voxel",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y, 400, 22),
+                CairoFont.WhiteSmallishText().WithWeight(Cairo.FontWeight.Bold)));
+            y += 26;
+
+            area.Add(new GuiElementStaticText(capi,
+                "Drop .obj + .mtl files into autochisel/obj_imports/. Colors come from the material Kd values. Textures (map_Kd) are not sampled in this version.",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y, CTRL_W, 52),
+                CairoFont.WhiteDetailText().WithColor(new double[] { 0.65, 0.75, 0.85, 0.85 })));
+            y += 58;
+
+            // --- File selector ---
+            if (importObjFiles.Count == 0)
+            {
+                area.Add(new GuiElementStaticText(capi,
+                    "No .obj files found in autochisel/obj_imports/.",
+                    EnumTextOrientation.Left, ElementBounds.Fixed(L, y, CTRL_W, 20),
+                    CairoFont.WhiteSmallishText().WithColor(new double[] { 1.0, 0.75, 0.5, 1.0 })));
+                y += 28;
+                area.Add(new GuiElementTextButton(capi, "Open Folder",
+                    CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                    () => { OpenObjFolder(); return true; },
+                    ElementBounds.Fixed(L, y, 140, 28), EnumButtonStyle.Small));
+                return;
+            }
+
+            if (importSelectedIdx < 0 || importSelectedIdx >= importObjFiles.Count)
+                importSelectedIdx = 0;
+            string selName = System.IO.Path.GetFileName(importObjFiles[importSelectedIdx]);
+
+            area.Add(new GuiElementStaticText(capi, "File",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            // Filename row: ["<"] [centered name, truncated if long] [">"]
+            // Strip ".obj" then suffix-truncate to keep the row from wrapping
+            // into the next field. The 170-wide bounds comfortably fits the
+            // 20-char + "..." form at every GUI scale.
+            string displayName = selName;
+            if (!string.IsNullOrEmpty(displayName)
+                && displayName.EndsWith(".obj", StringComparison.OrdinalIgnoreCase))
+                displayName = displayName.Substring(0, displayName.Length - 4);
+            displayName = TruncateName(displayName);
+
+            area.Add(new GuiElementTextButton(capi, "<",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importSelectedIdx = (importSelectedIdx - 1 + importObjFiles.Count) % importObjFiles.Count;
+                    InvalidateImportPreview(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX, y, 32, 28), EnumButtonStyle.Small));
+            area.Add(new GuiElementStaticText(capi, displayName ?? "",
+                EnumTextOrientation.Center, ElementBounds.Fixed(ctrlX + 36, y + 6, 170, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, ">",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importSelectedIdx = (importSelectedIdx + 1) % importObjFiles.Count;
+                    InvalidateImportPreview(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX + 210, y, 32, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            // --- Resolution slider ---
+            area.Add(new GuiElementStaticText(capi, "Resolution (voxels)",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, "-",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importSettings.Resolution = Math.Max(8, importSettings.Resolution - 8);
+                    InvalidateImportPreview(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX, y, 32, 28), EnumButtonStyle.Small));
+            area.Add(new GuiElementStaticText(capi, importSettings.Resolution.ToString(),
+                EnumTextOrientation.Center, ElementBounds.Fixed(ctrlX + 36, y + 6, 48, 20),
+                CairoFont.WhiteSmallishText().WithWeight(Cairo.FontWeight.Bold)));
+            area.Add(new GuiElementTextButton(capi, "+",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importSettings.Resolution = Math.Min(256, importSettings.Resolution + 8);
+                    InvalidateImportPreview(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX + 88, y, 32, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            // --- Fill interior toggle ---
+            area.Add(new GuiElementStaticText(capi, "Fill interior",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, importSettings.FillInterior ? "ON" : "OFF",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importSettings.FillInterior = !importSettings.FillInterior;
+                    InvalidateImportPreview(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX, y, 55, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            // --- Flip Y toggle ---
+            area.Add(new GuiElementStaticText(capi, "Flip Y axis",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, importSettings.FlipY ? "ON" : "OFF",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importSettings.FlipY = !importSettings.FlipY;
+                    InvalidateImportPreview(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX, y, 55, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            // --- Swap Y/Z toggle ---
+            area.Add(new GuiElementStaticText(capi, "Swap Y ↔ Z axes",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, importSettings.SwapYZ ? "ON" : "OFF",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importSettings.SwapYZ = !importSettings.SwapYZ;
+                    InvalidateImportPreview(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX, y, 55, 28), EnumButtonStyle.Small));
+            y += ROW + 4;
+
+            // --- View angle hint + reset button ---
+            // The user rotates the 3D preview by dragging INSIDE the preview box
+            // (handled in OnMouseDown/Move/Up below). Button just snaps back to iso.
+            area.Add(new GuiElementStaticText(capi, "View angle",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, "Reset angle",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    importPreviewYaw = 30 * Math.PI / 180.0;
+                    importPreviewPitch = 20 * Math.PI / 180.0;
+                    RebuildImportTextureOnly(); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(ctrlX, y, 120, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            area.Add(new GuiElementStaticText(capi, "Drag inside the preview → rotate camera.",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y, CTRL_W, 18),
+                CairoFont.WhiteDetailText().WithColor(new double[] { 0.6, 0.7, 0.85, 0.8 })));
+            y += 22;
+
+            // --- Status / last voxelization result ---
+            if (!string.IsNullOrEmpty(importStatus))
+            {
+                area.Add(new GuiElementStaticText(capi, importStatus,
+                    EnumTextOrientation.Left, ElementBounds.Fixed(L, y, CTRL_W, 20),
+                    CairoFont.WhiteDetailText().WithColor(new double[] { 0.8, 0.9, 0.6, 0.9 })));
+                y += 24;
+            }
+
+            // --- Save as .vox toggle ---
+            area.Add(new GuiElementStaticText(capi, "Save as .vox",
+                EnumTextOrientation.Left, ElementBounds.Fixed(L, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, importSaveAsVox ? "ON" : "OFF",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => { importSaveAsVox = !importSaveAsVox; SetupDialog(); return true; },
+                ElementBounds.Fixed(ctrlX, y, 55, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            // --- Action buttons ---
+            area.Add(new GuiElementTextButton(capi,
+                importSaveAsVox ? "Voxelize · Save · Load" : "Voxelize & Load",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => { OnImportGenerate(); return true; },
+                ElementBounds.Fixed(L, y, 220, 32), EnumButtonStyle.Normal));
+        }
+
+        /// <summary>Scans autochisel/obj_imports/ for .obj files (flat, no recursion).</summary>
+        private void RescanObjFolder()
+        {
+            importObjFiles.Clear();
+            try
+            {
+                if (SysIO.Directory.Exists(ModPaths.ObjImports))
+                {
+                    var files = SysIO.Directory.GetFiles(ModPaths.ObjImports, "*.obj");
+                    Array.Sort(files);
+                    importObjFiles.AddRange(files);
+                }
+            }
+            catch { }
+        }
+
+        private void InvalidateImportPreview()
+        {
+            importPreviewShape = null;
+            importPreviewTexture?.Dispose();
+            importPreviewTexture = null;
+            importStatus = "";
+            // NOTE: we deliberately do NOT reset importLastBuiltFor here — the
+            // RebuildImportPreviewIfNeeded caller manages that (it needs to
+            // compare keys before calling us, and overwrite the key after).
+        }
+
+        /// <summary>
+        /// Voxelizes (or re-voxelizes) the currently-selected .obj with the current
+        /// import settings, IF the last-built signature differs. Cache key covers
+        /// path + all settings so we don't redo work on every SetupDialog() tick.
+        /// </summary>
+        private void RebuildImportPreviewIfNeeded()
+        {
+            if (importSelectedIdx < 0 || importSelectedIdx >= importObjFiles.Count)
+            {
+                InvalidateImportPreview();
+                importLastBuiltFor = "";
+                return;
+            }
+
+            string path = importObjFiles[importSelectedIdx];
+            string key = $"{path}|{importSettings.Resolution}|{importSettings.FillInterior}|{importSettings.FlipY}|{importSettings.SwapYZ}";
+            if (key == importLastBuiltFor && importPreviewTexture != null) return;
+
+            InvalidateImportPreview();
+            importLastBuiltFor = key;
+
+            var mesh = ObjParser.Parse(path, out string err);
+            if (mesh == null) { importStatus = "OBJ parse failed: " + err; return; }
+
+            var shape = Voxelizer.Voxelize(mesh, importSettings, out string voxelStatus);
+            if (shape == null)
+            {
+                importStatus = (voxelStatus ?? "Voxelization failed.")
+                    + $"  (mesh: {mesh.Triangles.Count:N0} tris)";
+                return;
+            }
+
+            importPreviewShape = shape;
+            importStatus = voxelStatus + $"  ·  mesh {mesh.Triangles.Count:N0} tris / {mesh.Materials.Count} mtl";
+
+            // Build a VoxelsStorage and render a 3D preview with current yaw/pitch.
+            RebuildImportTextureOnly();
+        }
+
+        /// <summary>
+        /// Re-renders just the 3D preview texture from the already-voxelized
+        /// importPreviewShape, using the current yaw/pitch. Cheap compared to
+        /// a full voxelize — used when only the camera angle changed.
+        /// </summary>
+        private void RebuildImportTextureOnly()
+        {
+            importPreviewTexture?.Dispose();
+            importPreviewTexture = null;
+            if (importPreviewShape == null) return;
+
+            string baseName = importSelectedIdx >= 0 && importSelectedIdx < importObjFiles.Count
+                ? System.IO.Path.GetFileNameWithoutExtension(importObjFiles[importSelectedIdx])
+                : "preview";
+            var storage = VoxelArrayConverter.FromShape(importPreviewShape, baseName);
+            if (storage != null && storage.GetBlockCount() > 0)
+            {
+                importPreviewTexture = ModelPreview.CreatePreviewTexture3D(
+                    capi, storage, 300, importPreviewYaw, importPreviewPitch);
+            }
+        }
+
+        private void OnImportGenerate()
+        {
+            if (importSelectedIdx < 0 || importSelectedIdx >= importObjFiles.Count) return;
+
+            if (importPreviewShape == null)
+            {
+                RebuildImportPreviewIfNeeded();
+                if (importPreviewShape == null) { SetupDialog(); return; }
+            }
+
+            string path = importObjFiles[importSelectedIdx];
+            string baseName = System.IO.Path.GetFileNameWithoutExtension(path);
+            var storage = VoxelArrayConverter.FromShape(importPreviewShape, baseName,
+                "obj_import", new Dictionary<string, object>
+                {
+                    { "source",       System.IO.Path.GetFileName(path) },
+                    { "resolution",   importSettings.Resolution },
+                    { "fillInterior", importSettings.FillInterior },
+                    { "flipY",        importSettings.FlipY },
+                    { "swapYZ",       importSettings.SwapYZ }
+                });
+            if (storage == null || storage.GetBlockCount() == 0)
+            {
+                importStatus = "Generated shape is empty.";
+                SetupDialog();
+                return;
+            }
+
+            if (importSaveAsVox)
+            {
+                try
+                {
+                    string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                    string fname = $"{SanitizeFilename(baseName)}-{stamp}.vox";
+                    string outPath = SysPath.Combine(ModPaths.Models, fname);
+                    VoxFileWriter.Write(outPath, importPreviewShape);
+                    capi.ShowChatMessage($"[AutoChisel] Saved model: {fname}");
+                }
+                catch (Exception e)
+                {
+                    capi.ShowChatMessage($"[AutoChisel] Save failed: {e.Message}");
+                }
+            }
+
+            TryClose();
+            onGeneratedModel?.Invoke(storage);
+        }
+
+        private void OpenObjFolder()
+        {
+            try { System.Diagnostics.Process.Start("explorer.exe", ModPaths.ObjImports); }
+            catch { }
+        }
+
+        private void BuildSettingsTab(GuiComposer comp, ElementBounds insetBounds)
+        {
+            var s = ModSettings.Instance;
+            bool isSP = capi.IsSinglePlayer;
+
+            // Child container pinned inside the inset. All element bounds below
+            // are relative to this container's top-left corner — no FixedUnder gymnastics.
+            // insetBounds's AddInset visual frame was already added by SetupDialog.
+            var settingsArea = insetBounds.ForkContainingChild(20, 12, 20, 12);
+            comp.AddContainer(settingsArea, "settings-content");
+            comp.EndChildElements();
+
+            var area = comp.GetContainer("settings-content");
+
+            const double ROW = 38;
+            const double labelW = 220;
+            const double numX = labelW;
+            const double valX = numX + 36;
+            const double plusX = valX + 52;
+            double y = 0;
+
+            // === Header ===
+            area.Add(new GuiElementStaticText(capi, "Chisel speed",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y, 420, 22),
+                CairoFont.WhiteSmallishText().WithWeight(Cairo.FontWeight.Bold)));
+            y += 24;
+
+            area.Add(new GuiElementStaticText(capi,
+                isSP
+                    ? "Running in SINGLEPLAYER. Editing values for the SP track below."
+                    : "Running in MULTIPLAYER. Editing values for the MP track below.",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y, 560, 18),
+                CairoFont.WhiteDetailText().WithColor(new double[] { 0.75, 0.85, 1.0, 0.9 })));
+            y += 22;
+
+            area.Add(new GuiElementStaticText(capi,
+                "Ops per tick = how many chisel packets the mod sends per tick. Higher = faster, but can lag or desync on a busy server.",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y, 560, 36),
+                CairoFont.WhiteDetailText().WithColor(new double[] { 0.65, 0.75, 0.85, 0.85 })));
+            y += 40;
+
+            // === SP row ===
+            DrawSpeedRow(area, ref y, labelW, numX, valX, plusX, ROW, "Singleplayer",
+                () => s.MaxOpsPerTickSP,
+                v => {
+                    s.MaxOpsPerTickSP = Math.Max(1, Math.Min(64, v));
+                    if (s.InitialOpsPerTickSP > s.MaxOpsPerTickSP) s.InitialOpsPerTickSP = s.MaxOpsPerTickSP;
+                },
+                () => s.InitialOpsPerTickSP,
+                v => s.InitialOpsPerTickSP = Math.Max(1, Math.Min(s.MaxOpsPerTickSP, v)),
+                highlight: isSP);
+
+            y += 6;
+
+            // === MP row ===
+            DrawSpeedRow(area, ref y, labelW, numX, valX, plusX, ROW, "Multiplayer",
+                () => s.MaxOpsPerTickMP,
+                v => {
+                    s.MaxOpsPerTickMP = Math.Max(1, Math.Min(64, v));
+                    if (s.InitialOpsPerTickMP > s.MaxOpsPerTickMP) s.InitialOpsPerTickMP = s.MaxOpsPerTickMP;
+                },
+                () => s.InitialOpsPerTickMP,
+                v => s.InitialOpsPerTickMP = Math.Max(1, Math.Min(s.MaxOpsPerTickMP, v)),
+                highlight: !isSP);
+
+            y += 10;
+
+            // === Adaptive speed toggle ===
+            area.Add(new GuiElementStaticText(capi, "Adaptive speed",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, s.AdaptiveSpeed ? "ON" : "OFF",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => {
+                    s.AdaptiveSpeed = !s.AdaptiveSpeed;
+                    s.Save(capi); SetupDialog(); return true;
+                },
+                ElementBounds.Fixed(numX, y, 55, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            // === Explanation / footnote ===
+            area.Add(new GuiElementStaticText(capi,
+                s.AdaptiveSpeed
+                    ? "• Adaptive ON: speed starts at \"Initial\" and ramps up by 1 every 20 successful ticks until it reaches Max. MP lag halves the rate."
+                    : "• Adaptive OFF: speed stays locked at \"Initial\". Use this for slow servers or when you need a predictable rate.",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y, 560, 50),
+                CairoFont.WhiteDetailText().WithColor(new double[] { 0.6, 0.7, 0.85, 0.85 })));
+            y += 56;
+
+            // === Apply hint ===
+            area.Add(new GuiElementStaticText(capi,
+                "Changes apply on the next Start / Resume. Current run keeps its speed.",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y, 560, 20),
+                CairoFont.WhiteDetailText().WithColor(new double[] { 0.75, 0.75, 0.55, 0.85 })));
+        }
+
+        /// <summary>
+        /// Renders one pair of [- Max +] / [- Initial +] controls for either the
+        /// SP or MP speed track. highlight=true means this track is the one
+        /// currently active (used for a subtle visual hint).
+        /// </summary>
+        private void DrawSpeedRow(GuiElementContainer area, ref double y,
+            double labelW, double numX, double valX, double plusX, double ROW,
+            string trackName,
+            Func<int> getMax, Action<int> setMax,
+            Func<int> getInitial, Action<int> setInitial,
+            bool highlight)
+        {
+            // Track label
+            var font = CairoFont.WhiteSmallishText().WithWeight(Cairo.FontWeight.Bold);
+            if (highlight) font = font.WithColor(new double[] { 0.85, 1.0, 0.75, 1.0 });
+            area.Add(new GuiElementStaticText(capi, trackName + (highlight ? "  ← active" : ""),
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y, 300, 20),
+                font));
+            y += 22;
+
+            // Max ops
+            area.Add(new GuiElementStaticText(capi, "  Max ops per tick",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, "-",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => { setMax(getMax() - 1); ModSettings.Instance.Save(capi); SetupDialog(); return true; },
+                ElementBounds.Fixed(numX, y, 32, 28), EnumButtonStyle.Small));
+            area.Add(new GuiElementStaticText(capi, getMax().ToString(),
+                EnumTextOrientation.Center,
+                ElementBounds.Fixed(valX - 4, y + 6, 48, 20),
+                CairoFont.WhiteSmallishText().WithWeight(Cairo.FontWeight.Bold)));
+            area.Add(new GuiElementTextButton(capi, "+",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => { setMax(getMax() + 1); ModSettings.Instance.Save(capi); SetupDialog(); return true; },
+                ElementBounds.Fixed(plusX, y, 32, 28), EnumButtonStyle.Small));
+            y += ROW;
+
+            // Initial ops
+            area.Add(new GuiElementStaticText(capi, "  Initial ops per tick",
+                EnumTextOrientation.Left,
+                ElementBounds.Fixed(0, y + 6, labelW, 20),
+                CairoFont.WhiteSmallishText()));
+            area.Add(new GuiElementTextButton(capi, "-",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => { setInitial(getInitial() - 1); ModSettings.Instance.Save(capi); SetupDialog(); return true; },
+                ElementBounds.Fixed(numX, y, 32, 28), EnumButtonStyle.Small));
+            area.Add(new GuiElementStaticText(capi, getInitial().ToString(),
+                EnumTextOrientation.Center,
+                ElementBounds.Fixed(valX - 4, y + 6, 48, 20),
+                CairoFont.WhiteSmallishText().WithWeight(Cairo.FontWeight.Bold)));
+            area.Add(new GuiElementTextButton(capi, "+",
+                CairoFont.ButtonText(), CairoFont.ButtonPressedText(),
+                () => { setInitial(getInitial() + 1); ModSettings.Instance.Save(capi); SetupDialog(); return true; },
+                ElementBounds.Fixed(plusX, y, 32, 28), EnumButtonStyle.Small));
+            y += ROW;
+        }
+
         private bool OnOpenFolder()
         {
             try { System.Diagnostics.Process.Start("explorer.exe", ModPaths.Root); }
@@ -849,6 +1448,7 @@ namespace AutomaticChiselling
             generatorPreview?.Dispose();
             generatorPreview = null;
             genStats = null;
+            cachedGeneratorStorage = null;
 
             if (selectedGenerator < 0 || selectedGenerator >= generators.Count) return;
             var gen = generators[selectedGenerator];
@@ -860,7 +1460,9 @@ namespace AutomaticChiselling
                 var storage = VoxelArrayConverter.FromShape(shape, gen.Name);
                 if (storage == null || storage.GetBlockCount() == 0) return;
 
-                generatorPreview = ModelPreview.CreatePreviewTexture(capi, storage, 280);
+                cachedGeneratorStorage = storage;
+                generatorPreview = ModelPreview.CreatePreviewTexture3D(
+                    capi, storage, 280, genPreviewYaw, genPreviewPitch);
 
                 int ops = ChiselConveyor.CountChiselOperations(storage);
                 var dims = storage.GetModelDimensions();
@@ -871,10 +1473,23 @@ namespace AutomaticChiselling
                     ChiselOps = ops,
                     ChiselsNeeded = (float)Math.Ceiling(ops / (double)CHISEL_DURABILITY * 10) / 10f,
                     SizeX = dims.X, SizeY = dims.Y, SizeZ = dims.Z,
-                    TimeEstimate = FormatTime((int)(ops / OPS_PER_SEC_SP))
+                    TimeEstimate = FormatTime(ChiselConveyor.EstimateSeconds(capi, ops))
                 };
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Re-renders the Generators preview texture from the cached storage with
+        /// the current yaw/pitch. Does NOT regenerate the shape — used while the
+        /// user drags inside the preview box so rotation stays buttery.
+        /// </summary>
+        private void RebuildGeneratorTextureOnly()
+        {
+            if (cachedGeneratorStorage == null) return;
+            generatorPreview?.Dispose();
+            generatorPreview = ModelPreview.CreatePreviewTexture3D(
+                capi, cachedGeneratorStorage, 280, genPreviewYaw, genPreviewPitch);
         }
 
         private void OnGenerate()
@@ -958,6 +1573,16 @@ namespace AutomaticChiselling
             var mi = models[index];
             if (!mi.IsColored || mi.UsedPaletteIndices == null || mi.Palette == null) return;
 
+            // Build a fresh VoxelsStorage for the dialog's 3D preview. Load failures
+            // are non-fatal — the dialog still works without the preview panel.
+            VoxelsStorage previewStorage = null;
+            try
+            {
+                var s = new VoxelsStorage(mi.FileName);
+                if (s.GetBlockCount() > 0) previewStorage = s;
+            }
+            catch { }
+
             var dlg = new MaterialAssignmentDialog(capi, mi.FileName, mi.UsedPaletteIndices,
                 mi.Palette, mi.MaterialMapping, updated =>
                 {
@@ -966,7 +1591,7 @@ namespace AutomaticChiselling
                     sessionMaterialMappings[mi.FileName] = updated.Clone();
                     SavePersistedMappings();
                     needsRecompose = true; // refresh count in label
-                });
+                }, previewStorage);
             dlg.TryOpen();
         }
 
@@ -1008,6 +1633,21 @@ namespace AutomaticChiselling
                 double pvH = genPreviewBoxBounds.OuterHeight - inset * 2;
                 capi.Render.Render2DTexturePremultipliedAlpha(
                     generatorPreview.TextureId,
+                    (float)pvX, (float)pvY,
+                    (float)pvW, (float)pvH, 50f);
+            }
+
+            // Render Import-tab preview texture inside its dark frame.
+            if (currentTab == 2 && importPreviewTexture != null && importPreviewTexture.TextureId != 0
+                && importPreviewBoxBounds != null)
+            {
+                double inset = GuiElement.scaled(5);
+                double pvX = importPreviewBoxBounds.absX + inset;
+                double pvY = importPreviewBoxBounds.absY + inset;
+                double pvW = importPreviewBoxBounds.OuterWidth - inset * 2;
+                double pvH = importPreviewBoxBounds.OuterHeight - inset * 2;
+                capi.Render.Render2DTexturePremultipliedAlpha(
+                    importPreviewTexture.TextureId,
                     (float)pvX, (float)pvY,
                     (float)pvW, (float)pvH, 50f);
             }
@@ -1070,6 +1710,121 @@ namespace AutomaticChiselling
             }
         }
 
+
+        // ================================================================
+        // Mouse interaction — drag inside the Import preview box rotates the
+        // camera around the voxelized shape. Only regenerates the texture
+        // (cheap) not the whole voxelization (expensive).
+        // ================================================================
+
+        public override void OnMouseDown(MouseEvent args)
+        {
+            if (currentTab == 2 && importPreviewBoxBounds != null && IsInside(importPreviewBoxBounds, args.X, args.Y))
+            {
+                importDragging = true;
+                importDragStartX = args.X;
+                importDragStartY = args.Y;
+                importDragStartYaw = importPreviewYaw;
+                importDragStartPitch = importPreviewPitch;
+                args.Handled = true;
+                return;
+            }
+            if (currentTab == 1 && genPreviewBoxBounds != null && IsInside(genPreviewBoxBounds, args.X, args.Y))
+            {
+                genDragging = true;
+                genDragStartX = args.X;
+                genDragStartY = args.Y;
+                genDragStartYaw = genPreviewYaw;
+                genDragStartPitch = genPreviewPitch;
+                args.Handled = true;
+                return;
+            }
+            base.OnMouseDown(args);
+        }
+
+        public override void OnMouseMove(MouseEvent args)
+        {
+            if (importDragging)
+            {
+                double dx = args.X - importDragStartX;
+                double dy = args.Y - importDragStartY;
+                // ~0.6° per pixel feels natural — a full spin is ~600px of drag.
+                importPreviewYaw   = importDragStartYaw   + dx * (Math.PI / 300.0);
+                importPreviewPitch = importDragStartPitch - dy * (Math.PI / 300.0);
+                ClampPitch(ref importPreviewPitch);
+
+                // Throttle texture rebuild to ~30 fps so heavy meshes don't lag the UI.
+                long now = capi.ElapsedMilliseconds;
+                if (now - importLastDragRebuildMs >= 33)
+                {
+                    importLastDragRebuildMs = now;
+                    RebuildImportTextureOnly();
+                }
+                args.Handled = true;
+                return;
+            }
+            if (genDragging)
+            {
+                double dx = args.X - genDragStartX;
+                double dy = args.Y - genDragStartY;
+                genPreviewYaw   = genDragStartYaw   + dx * (Math.PI / 300.0);
+                genPreviewPitch = genDragStartPitch - dy * (Math.PI / 300.0);
+                ClampPitch(ref genPreviewPitch);
+
+                long now = capi.ElapsedMilliseconds;
+                if (now - genLastDragRebuildMs >= 33)
+                {
+                    genLastDragRebuildMs = now;
+                    RebuildGeneratorTextureOnly();
+                }
+                args.Handled = true;
+                return;
+            }
+            base.OnMouseMove(args);
+        }
+
+        public override void OnMouseUp(MouseEvent args)
+        {
+            if (importDragging)
+            {
+                importDragging = false;
+                RebuildImportTextureOnly();
+                args.Handled = true;
+                return;
+            }
+            if (genDragging)
+            {
+                genDragging = false;
+                RebuildGeneratorTextureOnly();
+                args.Handled = true;
+                return;
+            }
+            base.OnMouseUp(args);
+        }
+
+        private static void ClampPitch(ref double p)
+        {
+            if (p >  Math.PI / 2 - 0.05) p =  Math.PI / 2 - 0.05;
+            if (p < -Math.PI / 2 + 0.05) p = -Math.PI / 2 + 0.05;
+        }
+
+        private static bool IsInside(ElementBounds b, double x, double y)
+        {
+            return x >= b.absX && x < b.absX + b.OuterWidth
+                && y >= b.absY && y < b.absY + b.OuterHeight;
+        }
+
+        /// <summary>
+        /// Trim long file names so they don't overflow their text bounds and
+        /// run under adjacent buttons. Keeps the first <paramref name="maxChars"/>
+        /// characters and appends "...".
+        /// </summary>
+        private static string TruncateName(string name, int maxChars = 15)
+        {
+            if (string.IsNullOrEmpty(name) || name.Length <= maxChars) return name;
+            if (maxChars <= 3) return new string('.', maxChars);
+            return name.Substring(0, maxChars) + "...";
+        }
 
         private static void RoundRect(Context ctx, double x, double y, double w, double h, double r)
         {

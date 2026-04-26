@@ -13,6 +13,13 @@ namespace AutomaticChiselling
     {
         public int SizeX, SizeY, SizeZ;
         public List<VoxVoxel> Voxels = new List<VoxVoxel>();
+
+        /// <summary>
+        /// World translation of the model's bbox CENTER, resolved from the .vox
+        /// scene graph (nTRN/nGRP/nSHP chunks). 0,0,0 if the file has no scene graph
+        /// (single-model export) or if this model isn't referenced by any nSHP.
+        /// </summary>
+        public int WorldX, WorldY, WorldZ;
     }
 
     public struct VoxVoxel
@@ -37,10 +44,37 @@ namespace AutomaticChiselling
         }
     }
 
+    /// <summary>Transform node (nTRN) — one level of the scene graph, holds a translation.</summary>
+    internal class VoxTransformNode
+    {
+        public int Id;
+        public int ChildNodeId;
+        public int TX, TY, TZ;
+    }
+
+    /// <summary>Group node (nGRP) — branches to multiple children.</summary>
+    internal class VoxGroupNode
+    {
+        public int Id;
+        public int[] ChildNodeIds;
+    }
+
+    /// <summary>Shape node (nSHP) — leaf that references one or more models by index.</summary>
+    internal class VoxShapeNode
+    {
+        public int Id;
+        public int[] ModelIds;
+    }
+
     public class VoxFile
     {
         public List<VoxModel> Models = new List<VoxModel>();
         public VoxColor[] Palette = new VoxColor[256];
+
+        // Scene-graph tables — populated during parsing, consumed in ResolveSceneGraph.
+        internal Dictionary<int, VoxTransformNode> TransformNodes = new Dictionary<int, VoxTransformNode>();
+        internal Dictionary<int, VoxGroupNode> GroupNodes = new Dictionary<int, VoxGroupNode>();
+        internal Dictionary<int, VoxShapeNode> ShapeNodes = new Dictionary<int, VoxShapeNode>();
 
         /// <summary>
         /// Default MagicaVoxel palette used when no RGBA chunk is present.
@@ -178,8 +212,20 @@ namespace AutomaticChiselling
                         }
                         break;
 
+                    case "nTRN":
+                        ReadTransformNode(reader, result);
+                        break;
+
+                    case "nGRP":
+                        ReadGroupNode(reader, result);
+                        break;
+
+                    case "nSHP":
+                        ReadShapeNode(reader, result);
+                        break;
+
                     default:
-                        // Skip unknown chunks
+                        // Skip unknown chunks (nLAY, MATL, rOBJ, IMAP, etc.)
                         break;
                 }
 
@@ -187,7 +233,170 @@ namespace AutomaticChiselling
                 reader.BaseStream.Position = chunkStart + contentSize + childrenSize;
             }
 
+            // If the file has a scene graph, walk it and stamp each model with its
+            // resolved world translation. Files with no nTRN/nGRP/nSHP chunks
+            // (old single-model exports) leave WorldX/Y/Z at their default zeros.
+            ResolveSceneGraph(result);
+
             return result;
+        }
+
+        // ================================================================
+        // Scene graph (nTRN / nGRP / nSHP) — needed for models that MagicaVoxel
+        // auto-split into multiple SIZE+XYZI chunks because at least one axis
+        // exceeds ~256 voxels. Without translations, chunks stack at origin.
+        // ================================================================
+
+        private static void ReadTransformNode(BinaryReader r, VoxFile f)
+        {
+            int nodeId = r.ReadInt32();
+            SkipDict(r);                    // node attributes
+            int childId = r.ReadInt32();
+            r.ReadInt32();                  // reserved_id (must be -1)
+            r.ReadInt32();                  // layer_id
+            int numFrames = r.ReadInt32();
+
+            int tx = 0, ty = 0, tz = 0;
+            for (int frame = 0; frame < numFrames; frame++)
+            {
+                var frameAttrs = ReadDict(r);
+                if (frame == 0 && frameAttrs.TryGetValue("_t", out string tStr))
+                {
+                    // "_t" is a space-separated "x y z" string of integers.
+                    var parts = tStr.Split(' ');
+                    if (parts.Length >= 3)
+                    {
+                        int.TryParse(parts[0], out tx);
+                        int.TryParse(parts[1], out ty);
+                        int.TryParse(parts[2], out tz);
+                    }
+                }
+                // "_r" rotation is intentionally ignored — 99% of .vox files don't
+                // rotate sub-models, and supporting it would complicate voxel math
+                // significantly. Warn path could be added later if needed.
+            }
+
+            f.TransformNodes[nodeId] = new VoxTransformNode
+            {
+                Id = nodeId,
+                ChildNodeId = childId,
+                TX = tx, TY = ty, TZ = tz
+            };
+        }
+
+        private static void ReadGroupNode(BinaryReader r, VoxFile f)
+        {
+            int nodeId = r.ReadInt32();
+            SkipDict(r);
+            int numChildren = r.ReadInt32();
+            var children = new int[numChildren];
+            for (int i = 0; i < numChildren; i++) children[i] = r.ReadInt32();
+
+            f.GroupNodes[nodeId] = new VoxGroupNode { Id = nodeId, ChildNodeIds = children };
+        }
+
+        private static void ReadShapeNode(BinaryReader r, VoxFile f)
+        {
+            int nodeId = r.ReadInt32();
+            SkipDict(r);
+            int numModels = r.ReadInt32();
+            var modelIds = new int[numModels];
+            for (int i = 0; i < numModels; i++)
+            {
+                modelIds[i] = r.ReadInt32();
+                SkipDict(r);                // per-model attributes
+            }
+
+            f.ShapeNodes[nodeId] = new VoxShapeNode { Id = nodeId, ModelIds = modelIds };
+        }
+
+        private static void ResolveSceneGraph(VoxFile f)
+        {
+            if (f.TransformNodes.Count == 0 && f.GroupNodes.Count == 0 && f.ShapeNodes.Count == 0)
+                return; // no scene graph — legacy single-model layout
+
+            // Root = any transform node not referenced as a child anywhere.
+            // MagicaVoxel always starts with a transform at id=0, but we find it
+            // robustly in case the format changes.
+            var referenced = new HashSet<int>();
+            foreach (var t in f.TransformNodes.Values) referenced.Add(t.ChildNodeId);
+            foreach (var g in f.GroupNodes.Values)
+                foreach (var c in g.ChildNodeIds) referenced.Add(c);
+
+            int rootId = -1;
+            foreach (var id in f.TransformNodes.Keys)
+            {
+                if (!referenced.Contains(id)) { rootId = id; break; }
+            }
+            if (rootId < 0) return; // cycle or malformed — leave translations at zero
+
+            Traverse(f, rootId, 0, 0, 0, new HashSet<int>());
+        }
+
+        private static void Traverse(VoxFile f, int nodeId, int tx, int ty, int tz,
+            HashSet<int> visited)
+        {
+            // Guard against accidentally-cyclic graphs — defensive only.
+            if (!visited.Add(nodeId)) return;
+
+            if (f.TransformNodes.TryGetValue(nodeId, out var t))
+            {
+                Traverse(f, t.ChildNodeId, tx + t.TX, ty + t.TY, tz + t.TZ, visited);
+            }
+            else if (f.GroupNodes.TryGetValue(nodeId, out var g))
+            {
+                foreach (var c in g.ChildNodeIds) Traverse(f, c, tx, ty, tz, visited);
+            }
+            else if (f.ShapeNodes.TryGetValue(nodeId, out var s))
+            {
+                foreach (var modelId in s.ModelIds)
+                {
+                    if (modelId >= 0 && modelId < f.Models.Count)
+                    {
+                        f.Models[modelId].WorldX = tx;
+                        f.Models[modelId].WorldY = ty;
+                        f.Models[modelId].WorldZ = tz;
+                    }
+                }
+            }
+        }
+
+        // --- DICT / STRING helpers (MagicaVoxel chunk attributes) ---
+
+        private static Dictionary<string, string> ReadDict(BinaryReader r)
+        {
+            int count = r.ReadInt32();
+            var dict = new Dictionary<string, string>(count);
+            for (int i = 0; i < count; i++)
+            {
+                string key = ReadDictString(r);
+                string val = ReadDictString(r);
+                dict[key] = val;
+            }
+            return dict;
+        }
+
+        private static void SkipDict(BinaryReader r)
+        {
+            int count = r.ReadInt32();
+            for (int i = 0; i < count; i++)
+            {
+                SkipDictString(r);
+                SkipDictString(r);
+            }
+        }
+
+        private static string ReadDictString(BinaryReader r)
+        {
+            int len = r.ReadInt32();
+            if (len <= 0) return "";
+            return Encoding.UTF8.GetString(r.ReadBytes(len));
+        }
+
+        private static void SkipDictString(BinaryReader r)
+        {
+            int len = r.ReadInt32();
+            if (len > 0) r.BaseStream.Position += len;
         }
     }
 }

@@ -123,7 +123,10 @@ namespace AutomaticChiselling
             storage.GeneratorParams = generatorParams != null
                 ? new Dictionary<string, object>(generatorParams) : null;
             storage.rawVoxels = voxels;
-            storage.originalRawVoxels = voxels.Select(v =>
+            // Normalize once so generator output behaves the same as a loaded .vox —
+            // bbox min at (0,0,0). originalRawVoxels is the post-normalization backup.
+            storage.NormalizeRawVoxelsToOrigin();
+            storage.originalRawVoxels = storage.rawVoxels.Select(v =>
                 new RawVoxel(new Vec3i(v.Position.X, v.Position.Y, v.Position.Z), v.ColorIndex)).ToList();
 
             storage.Palette = new byte[256][];
@@ -183,12 +186,61 @@ namespace AutomaticChiselling
 
             foreach (var model in voxFile.Models)
             {
-                // MagicaVoxel: Y-up, VS: Z-up. Convert: (X, Z, -Y)
+                // MagicaVoxel's scene-graph _t translation targets the BBOX CENTER of
+                // each model. Local voxel coords are 0..size-1, so world voxel =
+                //   local − floor(size/2) + translation
+                // Files with no scene graph leave WorldX/Y/Z = 0 and we still subtract
+                // halfsize, but NormalizeRawVoxelsToOrigin below shifts the resulting
+                // cloud's min back to (0,0,0), so the final layout is unchanged for
+                // single-model legacy files.
+                int halfX = model.SizeX / 2;
+                int halfY = model.SizeY / 2;
+                int halfZ = model.SizeZ / 2;
                 foreach (var v in model.Voxels)
                 {
-                    Vec3i voxel = new Vec3i(v.X, v.Z, -v.Y);
+                    int mvX = v.X - halfX + model.WorldX;
+                    int mvY = v.Y - halfY + model.WorldY;
+                    int mvZ = v.Z - halfZ + model.WorldZ;
+                    // MagicaVoxel: Y-up. VS: Y-up but with Z flipped relative to MV's Y.
+                    // Convert: (X, Z, -Y).
+                    Vec3i voxel = new Vec3i(mvX, mvZ, -mvY);
                     rawVoxels.Add(new RawVoxel(voxel, v.ColorIndex));
                 }
+            }
+
+            // MagicaVoxel→VS conversion produces negative Z (from −Y). Normalize
+            // the bbox min to (0,0,0) ONCE here at load so downstream rotation
+            // works on origin-aligned voxels. ApplyAlignModel no longer performs
+            // this shift — it only shifts by the block-aligned envelope origin
+            // so rotated models can preserve their face position within a block.
+            NormalizeRawVoxelsToOrigin();
+        }
+
+        /// <summary>
+        /// Shifts rawVoxels so their bbox min sits at (0,0,0). Called once per
+        /// model load (.vox file or generator init) so subsequent rotations
+        /// operate on a canonical origin, and ApplyAlignModel can safely
+        /// preserve model-within-envelope offsets produced by rotation.
+        /// </summary>
+        private void NormalizeRawVoxelsToOrigin()
+        {
+            if (rawVoxels == null || rawVoxels.Count == 0) return;
+            int minX = rawVoxels[0].Position.X;
+            int minY = rawVoxels[0].Position.Y;
+            int minZ = rawVoxels[0].Position.Z;
+            for (int i = 1; i < rawVoxels.Count; i++)
+            {
+                var p = rawVoxels[i].Position;
+                if (p.X < minX) minX = p.X;
+                if (p.Y < minY) minY = p.Y;
+                if (p.Z < minZ) minZ = p.Z;
+            }
+            if (minX == 0 && minY == 0 && minZ == 0) return;
+            for (int i = 0; i < rawVoxels.Count; i++)
+            {
+                var rv = rawVoxels[i];
+                rv.Position = new Vec3i(rv.Position.X - minX, rv.Position.Y - minY, rv.Position.Z - minZ);
+                rawVoxels[i] = rv;
             }
         }
 
@@ -215,29 +267,42 @@ namespace AutomaticChiselling
                 if (p.Z > maxZ) maxZ = p.Z;
             }
 
-            // Normalize to (0,0,0) origin
-            for (int i = 0; i < rawVoxels.Count; i++)
+            // Snap the envelope (block-aligned container) to start at (0,0,0) without
+            // re-pinning the model to the (0,0,0) corner. Shift only by the envelope
+            // origin, NOT by the bbox min — so if rotation placed the model at the
+            // "back face" of its envelope (e.g. z=15), it stays at the back face.
+            int envMinX = (int)Math.Floor(minX / 16f) * 16;
+            int envMinY = (int)Math.Floor(minY / 16f) * 16;
+            int envMinZ = (int)Math.Floor(minZ / 16f) * 16;
+            if (envMinX != 0 || envMinY != 0 || envMinZ != 0)
             {
-                var rv = rawVoxels[i];
-                rv.Position = new Vec3i(rv.Position.X - minX, rv.Position.Y - minY, rv.Position.Z - minZ);
-                rawVoxels[i] = rv;
+                for (int i = 0; i < rawVoxels.Count; i++)
+                {
+                    var rv = rawVoxels[i];
+                    rv.Position = new Vec3i(
+                        rv.Position.X - envMinX,
+                        rv.Position.Y - envMinY,
+                        rv.Position.Z - envMinZ);
+                    rawVoxels[i] = rv;
+                }
+                maxX -= envMinX; minX -= envMinX;
+                maxY -= envMinY; minY -= envMinY;
+                maxZ -= envMinZ; minZ -= envMinZ;
             }
 
-            int sizeX = maxX - minX + 1;
-            int sizeY = maxY - minY + 1;
-            int sizeZ = maxZ - minZ + 1;
+            // Block envelope dimensions are computed from the MAX side (bbox max + 1),
+            // because the model's position inside the envelope is now meaningful.
+            int blockSizeX = (int)Math.Ceiling((maxX + 1) / 16f);
+            int blockSizeY = (int)Math.Ceiling((maxY + 1) / 16f);
+            int blockSizeZ = (int)Math.Ceiling((maxZ + 1) / 16f);
 
-            int blockSizeX = (int)Math.Ceiling(sizeX / 16f);
-            int blockSizeY = (int)Math.Ceiling(sizeY / 16f);
-            int blockSizeZ = (int)Math.Ceiling(sizeZ / 16f);
-
-            // ALWAYS center voxels within their block grid on ALL 3 axes.
-            // This ensures rotation doesn't shift the model within blocks.
-            // Alignment (Center/NE/NW/etc.) only affects BlockCorrection (block-level offset).
-            int correctX = (blockSizeX * 16 - sizeX) / 2;
-            int correctY = (blockSizeY * 16 - sizeY) / 2;
-            int correctZ = (blockSizeZ * 16 - sizeZ) / 2;
-
+            // Voxels stay pinned to the (0,0,0) corner of their block envelope.
+            // Previously we also centered them within the envelope on all three axes,
+            // but that shifted thin models (e.g. decal/sticker slabs) into the middle
+            // of a chisel block instead of flush against a face. Removing the voxel-
+            // level centering lets generators produce shapes that sit at a known edge;
+            // block-level placement is still controlled by Allign below.
+            //
             // BlockCorrection: how many blocks to shift for alignment relative to anchor
             switch (Allign)
             {
@@ -260,20 +325,6 @@ namespace AutomaticChiselling
                 default: // Center
                     BlockCorrection = new Vec3i(blockSizeX / 2, 0, blockSizeZ / 2);
                     break;
-            }
-
-            if (correctX != 0 || correctY != 0 || correctZ != 0)
-            {
-                for (int i = 0; i < rawVoxels.Count; i++)
-                {
-                    var rv = rawVoxels[i];
-                    rv.Position = new Vec3i(
-                        rv.Position.X + correctX,
-                        rv.Position.Y + correctY,
-                        rv.Position.Z + correctZ
-                    );
-                    rawVoxels[i] = rv;
-                }
             }
         }
 
@@ -409,6 +460,37 @@ namespace AutomaticChiselling
             if (rotationY == 0 && rotationX == 0 && rotationZ == 0)
                 return;
 
+            // Compute the pre-rotation bbox, then the block-aligned envelope that
+            // contains it. The envelope's CENTER is our pivot for rotations — this
+            // way 180° rotations actually flip thin models (stickers, slabs) to
+            // the opposite face of their block container, matching the user's
+            // "spin the object in my hand" intuition.
+            int minX = rawVoxels[0].Position.X, maxX = minX;
+            int minY = rawVoxels[0].Position.Y, maxY = minY;
+            int minZ = rawVoxels[0].Position.Z, maxZ = minZ;
+            for (int i = 1; i < rawVoxels.Count; i++)
+            {
+                var p = rawVoxels[i].Position;
+                if (p.X < minX) minX = p.X; if (p.X > maxX) maxX = p.X;
+                if (p.Y < minY) minY = p.Y; if (p.Y > maxY) maxY = p.Y;
+                if (p.Z < minZ) minZ = p.Z; if (p.Z > maxZ) maxZ = p.Z;
+            }
+
+            int envMinX = (int)Math.Floor(minX / 16f) * 16;
+            int envMinY = (int)Math.Floor(minY / 16f) * 16;
+            int envMinZ = (int)Math.Floor(minZ / 16f) * 16;
+            int envMaxX = (int)Math.Ceiling((maxX + 1) / 16f) * 16;
+            int envMaxY = (int)Math.Ceiling((maxY + 1) / 16f) * 16;
+            int envMaxZ = (int)Math.Ceiling((maxZ + 1) / 16f) * 16;
+
+            // Center in 2x-integer units. Envelope width is always even (16-aligned),
+            // so envMin + envMax is even, and envMin+envMax-1 is odd. We do all
+            // rotation math in 2x coords to keep integer precision through the
+            // 90°/180°/270° swaps, then halve at the end — result is always exact.
+            int cx2 = envMinX + envMaxX - 1;
+            int cy2 = envMinY + envMaxY - 1;
+            int cz2 = envMinZ + envMaxZ - 1;
+
             int stepsY = rotationY / 90;
             int stepsX = rotationX / 90;
             int stepsZ = rotationZ / 90;
@@ -416,38 +498,27 @@ namespace AutomaticChiselling
             for (int i = 0; i < rawVoxels.Count; i++)
             {
                 var rv = rawVoxels[i];
-                int x = rv.Position.X;
-                int y = rv.Position.Y;
-                int z = rv.Position.Z;
+                int x = 2 * rv.Position.X - cx2;
+                int y = 2 * rv.Position.Y - cy2;
+                int z = 2 * rv.Position.Z - cz2;
 
-                // Apply Y rotation first (horizontal)
+                // Y first (horizontal spin, looking down)
                 for (int s = 0; s < stepsY; s++)
                 {
-                    // 90° CW around Y (looking down): (x, z) -> (z, -x)
-                    int tmp = x;
-                    x = z;
-                    z = -tmp;
+                    int tmp = x; x = z; z = -tmp;
                 }
-
-                // Then X rotation (vertical tilt forward/back)
+                // Then X (forward/back tilt)
                 for (int s = 0; s < stepsX; s++)
                 {
-                    // 90° CW around X (looking from right): (y, z) -> (z, -y)
-                    int tmp = y;
-                    y = z;
-                    z = -tmp;
+                    int tmp = y; y = z; z = -tmp;
                 }
-
-                // Then Z rotation (roll left/right around camera's forward axis)
+                // Then Z (roll)
                 for (int s = 0; s < stepsZ; s++)
                 {
-                    // 90° CW around Z (looking along +Z): (x, y) -> (y, -x)
-                    int tmp = x;
-                    x = y;
-                    y = -tmp;
+                    int tmp = x; x = y; y = -tmp;
                 }
 
-                rv.Position = new Vec3i(x, y, z);
+                rv.Position = new Vec3i((x + cx2) / 2, (y + cy2) / 2, (z + cz2) / 2);
                 rawVoxels[i] = rv;
             }
         }

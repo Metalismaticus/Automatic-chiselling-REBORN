@@ -14,19 +14,31 @@ namespace AutomaticChiselling
     /// </summary>
     public class MaterialAssignmentDialog : GuiDialog
     {
-        private const int DLG_W = 740;
+        private const int DLG_W = 1040;
         private const int ROW_H = 54;
         private const int HEADER_H = 72;   // title-bar + hint text area
         private const int MAX_INSET_H = 8 * ROW_H;  // max visible rows before scroll kicks in
         private const int FOOTER_H = 10;
+        private const int PV_SIZE = 300;   // edge of the square 3D preview box (right column)
+        private const int PV_MARGIN = 20;  // gap between row inset and preview box
 
         private readonly string modelName;
         private readonly List<byte> usedIndices;
         private readonly byte[][] palette;
         private readonly MaterialMapping mapping;
         private readonly Action<MaterialMapping> onUpdated;
+        private readonly VoxelsStorage storage;  // may be null if caller couldn't build one
 
         private List<InventoryBlock> candidates = new List<InventoryBlock>();
+
+        // --- 3D preview state (same camera conventions as ModelBrowserDialog) ---
+        private ElementBounds previewBoxBounds;
+        private LoadedTexture previewTexture;
+        private double previewYaw = 30 * Math.PI / 180.0;
+        private double previewPitch = 20 * Math.PI / 180.0;
+        private bool dragging = false;
+        private double dragStartX, dragStartY, dragStartYaw, dragStartPitch;
+        private long lastDragRebuildMs = 0;
 
         public override string ToggleKeyCombinationCode => "autochisel_materials";
 
@@ -39,15 +51,31 @@ namespace AutomaticChiselling
 
         public MaterialAssignmentDialog(ICoreClientAPI capi, string modelName,
             List<byte> usedIndices, byte[][] palette,
-            MaterialMapping mapping, Action<MaterialMapping> onUpdated) : base(capi)
+            MaterialMapping mapping, Action<MaterialMapping> onUpdated,
+            VoxelsStorage storage = null) : base(capi)
         {
             this.modelName = modelName;
             this.usedIndices = new List<byte>(usedIndices);
             this.palette = palette;
             this.mapping = mapping ?? new MaterialMapping();
             this.onUpdated = onUpdated;
+            this.storage = storage;
             ScanInventory();
             SetupDialog();
+            RebuildPreviewTexture();
+        }
+
+        /// <summary>
+        /// Re-renders the 3D preview texture at the current yaw/pitch. Cheap
+        /// (~20-50ms for typical models) so we can call it freely during drag.
+        /// </summary>
+        private void RebuildPreviewTexture()
+        {
+            previewTexture?.Dispose();
+            previewTexture = null;
+            if (storage == null || storage.GetBlockCount() == 0) return;
+            previewTexture = ModelPreview.CreatePreviewTexture3D(
+                capi, storage, PV_SIZE - 10, previewYaw, previewPitch);
         }
 
         private void ScanInventory()
@@ -114,7 +142,9 @@ namespace AutomaticChiselling
             int totalRows = Math.Max(1, usedIndices.Count);
             int contentH = totalRows * ROW_H;
             int insetH = Math.Min(contentH, MAX_INSET_H);
-            int dlgH = HEADER_H + insetH + FOOTER_H;
+            // Dialog height must accommodate the taller of: row inset or preview box.
+            int bodyH = Math.Max(insetH, PV_SIZE);
+            int dlgH = HEADER_H + bodyH + FOOTER_H;
 
             var dialogBounds = ElementStdBounds.AutosizedMainDialog.WithAlignment(EnumDialogArea.CenterMiddle);
             var bgBounds = ElementBounds.Fixed(0, 0, DLG_W, dlgH);
@@ -140,13 +170,18 @@ namespace AutomaticChiselling
                 ? "⚠  No blocks detected in hotbar/backpack. Move some chisellable blocks to inventory and reopen."
                 : $"{candidates.Count} block(s) available · {assigned}/{usedIndices.Count} colors assigned";
 
-            // Scroll area bounds
+            // --- Layout ---
+            // [ rows inset .............. | preview box ] with PV_MARGIN between them.
+            // Reserve the right column for the 3D preview; rows get the rest.
             int insetY = HEADER_H;
-            int insetW = DLG_W - 20 - 20; // 20 left margin, 20 right (scrollbar will sit in this)
+            int previewX = DLG_W - 20 - PV_SIZE;     // 20 right-margin
+            int insetW = previewX - PV_MARGIN - 10;  // 10 left-margin + gap before preview
             var insetBounds = ElementBounds.Fixed(10, insetY, insetW, insetH);
             var scrollbarBounds = insetBounds.RightCopy().WithFixedWidth(20);
             var clipBounds = insetBounds.ForkContainingChild(2, 2, 2, 2);
             var containerBounds = insetBounds.ForkContainingChild(2, 2, 2, 2);
+
+            previewBoxBounds = ElementBounds.Fixed(previewX, insetY, PV_SIZE, PV_SIZE);
 
             var compo = capi.Gui.CreateCompo("autochisel_materials", dialogBounds)
                 .AddShadedDialogBG(bgBounds, true)
@@ -163,6 +198,21 @@ namespace AutomaticChiselling
                  .BeginClip(clipBounds)
                  .AddContainer(containerBounds, "rows-content")
                  .EndClip();
+
+            // --- 3D preview frame on the right ---
+            compo.AddStaticCustomDraw(previewBoxBounds, (ctx, s, b) =>
+            {
+                ctx.SetSourceRGBA(0.08, 0.08, 0.1, 0.85);
+                ctx.Rectangle(b.drawX, b.drawY, b.InnerWidth, b.InnerHeight);
+                ctx.Fill();
+                ctx.SetSourceRGBA(0.3, 0.32, 0.35, 0.4);
+                ctx.Rectangle(b.drawX, b.drawY, b.InnerWidth, b.InnerHeight);
+                ctx.LineWidth = 1; ctx.Stroke();
+            });
+            // Hint below the preview
+            compo.AddStaticText("Drag to rotate · preview",
+                CairoFont.WhiteDetailText().WithColor(new double[] { 0.55, 0.65, 0.8, 0.85 }),
+                ElementBounds.Fixed(previewX, insetY + PV_SIZE + 2, PV_SIZE, 18));
 
             if (contentH > insetH)
             {
@@ -297,6 +347,85 @@ namespace AutomaticChiselling
             mapping.Unassign(pIdx);
             onUpdated?.Invoke(mapping);
             SetupDialog();
+        }
+
+        // ================================================================
+        // 3D preview rendering + drag-to-rotate
+        // ================================================================
+
+        public override void OnRenderGUI(float deltaTime)
+        {
+            base.OnRenderGUI(deltaTime);
+            if (previewTexture != null && previewTexture.TextureId != 0 && previewBoxBounds != null)
+            {
+                double inset = GuiElement.scaled(5);
+                double x = previewBoxBounds.absX + inset;
+                double y = previewBoxBounds.absY + inset;
+                double w = previewBoxBounds.OuterWidth - inset * 2;
+                double h = previewBoxBounds.OuterHeight - inset * 2;
+                capi.Render.Render2DTexturePremultipliedAlpha(
+                    previewTexture.TextureId, (float)x, (float)y, (float)w, (float)h, 50f);
+            }
+        }
+
+        public override void OnMouseDown(MouseEvent args)
+        {
+            if (previewBoxBounds != null && IsInside(previewBoxBounds, args.X, args.Y))
+            {
+                dragging = true;
+                dragStartX = args.X; dragStartY = args.Y;
+                dragStartYaw = previewYaw; dragStartPitch = previewPitch;
+                args.Handled = true;
+                return;
+            }
+            base.OnMouseDown(args);
+        }
+
+        public override void OnMouseMove(MouseEvent args)
+        {
+            if (dragging)
+            {
+                double dx = args.X - dragStartX;
+                double dy = args.Y - dragStartY;
+                previewYaw   = dragStartYaw   + dx * (Math.PI / 300.0);
+                previewPitch = dragStartPitch - dy * (Math.PI / 300.0);
+                if (previewPitch >  Math.PI / 2 - 0.05) previewPitch =  Math.PI / 2 - 0.05;
+                if (previewPitch < -Math.PI / 2 + 0.05) previewPitch = -Math.PI / 2 + 0.05;
+
+                long now = capi.ElapsedMilliseconds;
+                if (now - lastDragRebuildMs >= 33)
+                {
+                    lastDragRebuildMs = now;
+                    RebuildPreviewTexture();
+                }
+                args.Handled = true;
+                return;
+            }
+            base.OnMouseMove(args);
+        }
+
+        public override void OnMouseUp(MouseEvent args)
+        {
+            if (dragging)
+            {
+                dragging = false;
+                RebuildPreviewTexture();
+                args.Handled = true;
+                return;
+            }
+            base.OnMouseUp(args);
+        }
+
+        public override void Dispose()
+        {
+            previewTexture?.Dispose();
+            base.Dispose();
+        }
+
+        private static bool IsInside(ElementBounds b, double x, double y)
+        {
+            return x >= b.absX && x < b.absX + b.OuterWidth
+                && y >= b.absY && y < b.absY + b.OuterHeight;
         }
     }
 }

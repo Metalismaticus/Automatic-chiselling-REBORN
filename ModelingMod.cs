@@ -204,8 +204,7 @@ namespace AutomaticChiselling
                 float pct = progress.TotalOperations > 0
                     ? (float)progress.CurrentIndex / progress.TotalOperations * 100f : 0f;
 
-                int chiselOps = ChiselConveyor.CountChiselOperations(storage);
-                progressHud.ShowModelLoaded(progress.ModelFileName, chiselOps);
+                progressHud.ShowModelLoaded();
                 progressHud.UpdateProgress(pct);
                 progressHud.ShowPaused();
 
@@ -228,7 +227,7 @@ namespace AutomaticChiselling
             {
                 // Resume from pause (same session)
                 conveyor.ResumeConveyor();
-                progressHud.ShowChiseling(storage.GetFileName());
+                progressHud.ShowChiseling();
                 capi.ShowChatMessage("Resumed.");
                 return;
             }
@@ -252,7 +251,7 @@ namespace AutomaticChiselling
 
                 hologram.SetVisible(false);
                 previewMode = false;
-                progressHud.ShowChiseling(storage.GetFileName());
+                progressHud.ShowChiseling();
                 capi.ShowChatMessage($"Resumed from {(int)(progress.TotalOperations > 0 ? (float)progress.CurrentIndex / progress.TotalOperations * 100f : 0)}%");
                 return;
             }
@@ -273,7 +272,7 @@ namespace AutomaticChiselling
 
             hologram.SetVisible(false);
             previewMode = false;
-            progressHud.ShowChiseling(storage.GetFileName());
+            progressHud.ShowChiseling();
         }
 
         private void OnHudPause()
@@ -289,9 +288,18 @@ namespace AutomaticChiselling
         {
             if (conveyor != null && conveyor.ChisellingActive())
             {
+                // Active conveyor path: StopConveyor() also deletes the progress file.
                 conveyor.StopConveyor();
                 CleanupConveyor();
             }
+            else if (storage != null)
+            {
+                // Auto-restored (post game-restart) path: no live conveyor exists,
+                // but the progress JSON still sits on disk — delete it here or
+                // TryAutoRestore will keep offering the same paused run every load.
+                ChiselConveyor.DeleteProgressFile(storage.GetFileName());
+            }
+
             storage = null;
             hologram.SetVisible(false);
             previewMode = false;
@@ -345,7 +353,7 @@ namespace AutomaticChiselling
             int voxels = storage.GetTotalVoxelCount();
             int chiselOps = ChiselConveyor.CountChiselOperations(storage);
 
-            progressHud.ShowModelLoaded(storage.GetFileName(), chiselOps);
+            progressHud.ShowModelLoaded();
             capi.ShowChatMessage($"Generated: {storage.GetFileName()} ({blocks} blocks, {voxels} voxels, {chiselOps:N0} ops)");
         }
 
@@ -382,8 +390,7 @@ namespace AutomaticChiselling
             int chiselOps = ChiselConveyor.CountChiselOperations(storage);
             int interiorFilled = storage.InteriorVoxelsFilled;
 
-            // Show HUD with model info
-            progressHud.ShowModelLoaded(filename, chiselOps);
+            progressHud.ShowModelLoaded();
 
             string colorTag = "";
             if (storage.IsColored)
